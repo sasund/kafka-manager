@@ -8,16 +8,19 @@ package kafka.manager.model
 import java.util.Properties
 
 import grizzled.slf4j.Logging
-import kafka.common.TopicAndPartition
 import kafka.manager.jmx._
 import kafka.manager.utils
+import kafka.manager.utils.two40.MemberMetadata
 import kafka.manager.utils.zero81.ForceReassignmentCommand
+import org.apache.kafka.common.TopicPartition
 import org.joda.time.DateTime
 
 import scala.collection.immutable.Queue
-import scala.concurrent.{Await, Future}
-import scala.util.{Failure, Success, Try}
+import scala.util.Try
 import scalaz.{NonEmptyList, Validation}
+
+import scala.collection.immutable.SortedMap
+import scala.collection.immutable.Map
 
 /**
  * @author hiral
@@ -49,7 +52,9 @@ object ActorModel {
   case class BVView(topicPartitions: Map[TopicIdentity, BrokerTopicInfo], clusterContext: ClusterContext,
                     metrics: Option[BrokerMetrics] = None,
                     messagesPerSecCountHistory: Option[Queue[BrokerMessagesPerSecCount]] = None,
-                    stats: Option[BrokerClusterStats] = None) extends QueryResponse {
+                    stats: Option[BrokerClusterStats] = None,
+                    broker: Option[BrokerIdentity] = None
+                   ) extends QueryResponse {
     def numTopics : Int = topicPartitions.size
     def numPartitions : Int = topicPartitions.values.foldLeft(0)((acc,i) => acc + i.partitions.size)
     def numPartitionsAsLeader : Int = topicPartitions.values.foldLeft(0)((acc,i) => acc + i.partitionsAsLeader.size)
@@ -61,11 +66,13 @@ object ActorModel {
 
   case object CMGetView extends QueryRequest
   case class CMGetTopicIdentity(topic: String) extends QueryRequest
+  case class CMGetBrokerIdentity(broker: Int) extends QueryRequest
   case object CMGetClusterContext extends QueryRequest
   case class CMView(topicsCount: Int, brokersCount: Int, clusterContext: ClusterContext) extends QueryResponse
   case class CMGetConsumerIdentity(consumer: String, consumerType: ConsumerType) extends QueryRequest
   case class CMGetConsumedTopicState(consumer: String, topic: String, consumerType: ConsumerType) extends QueryRequest
   case class CMTopicIdentity(topicIdentity: Try[TopicIdentity]) extends QueryResponse
+  case class CMBrokerIdentity(brokerIdentity: Try[BrokerIdentity]) extends QueryResponse
   case class CMConsumerIdentity(consumerIdentity: Try[ConsumerIdentity]) extends QueryResponse
   case class CMConsumedTopic(ctIdentity: Try[ConsumedTopicState]) extends QueryResponse
   case class CMGetGeneratedPartitionAssignments(topic: String) extends QueryRequest
@@ -84,10 +91,12 @@ object ActorModel {
                                            partitions: Int,
                                            readVersions: Map[String,Int]) extends CommandRequest
   case class CMUpdateTopicConfig(topic: String, config: Properties, readVersion: Int) extends CommandRequest
+  case class CMUpdateBrokerConfig(broker: Int, config: Properties, readVersion: Int) extends CommandRequest
   case class CMDeleteTopic(topic: String) extends CommandRequest
   case class CMRunPreferredLeaderElection(topics: Set[String]) extends CommandRequest
+  case class CMSchedulePreferredLeaderElection(schedule: Map[String, Int]) extends CommandRequest
   case class CMRunReassignPartition(topics: Set[String], forceSet: Set[ForceReassignmentCommand]) extends CommandRequest
-  case class CMGeneratePartitionAssignments(topics: Set[String], brokers: Set[Int]) extends CommandRequest
+  case class CMGeneratePartitionAssignments(topics: Set[String], brokers: Set[Int], replicationFactor: Option[Int] = None) extends CommandRequest
   case class CMManualPartitionAssignments(assignments: List[(String, List[(Int, List[Int])])]) extends CommandRequest
 
   //these are used by Logkafka
@@ -98,8 +107,8 @@ object ActorModel {
                               log_path: String,
                               config: Properties = new Properties
                               ) extends CommandRequest
-  case class CMUpdateLogkafkaConfig(logkafka_id: String, 
-                                    log_path: String, 
+  case class CMUpdateLogkafkaConfig(logkafka_id: String,
+                                    log_path: String,
                                     config: Properties,
                                     checkConfig: Boolean = true
                                     ) extends CommandRequest
@@ -124,8 +133,9 @@ object ActorModel {
                                            partitions: Int,
                                            readVersions: Map[String, Int]) extends CommandRequest
   case class KCUpdateTopicConfig(topic: String, config: Properties, readVersion: Int) extends CommandRequest
+  case class KCUpdateBrokerConfig(broker: Int, config: Properties, readVersion: Int) extends CommandRequest
   case class KCDeleteTopic(topic: String) extends CommandRequest
-  case class KCPreferredReplicaLeaderElection(topicAndPartition: Set[TopicAndPartition]) extends CommandRequest
+  case class KCPreferredReplicaLeaderElection(topicAndPartition: Set[TopicPartition]) extends CommandRequest
   case class KCReassignPartition(currentTopicIdentity: Map[String, TopicIdentity]
                                  , generatedTopicIdentity: Map[String, TopicIdentity]
                                  , forceSet: Set[ForceReassignmentCommand]) extends CommandRequest
@@ -157,6 +167,7 @@ object ActorModel {
   case object KSGetConsumers extends KSRequest
   case class KSGetTopicConfig(topic: String) extends KSRequest
   case class KSGetTopicDescription(topic: String) extends KSRequest
+  case class KSGetBrokerDescription(broker: Int) extends KSRequest
   case class KSGetAllTopicDescriptions(lastUpdateMillis: Option[Long]= None) extends KSRequest
   case class KSGetTopicDescriptions(topics: Set[String]) extends KSRequest
   case class KSGetConsumerDescription(consumer: String, consumerType: ConsumerType) extends KSRequest
@@ -166,6 +177,7 @@ object ActorModel {
   case object KSGetTopicsLastUpdateMillis extends KSRequest
   case object KSGetPreferredLeaderElection extends KSRequest
   case object KSGetReassignPartition extends KSRequest
+  case object KSGetScheduleLeaderElection extends KSRequest
   case class KSEndPreferredLeaderElection(millis: Long) extends CommandRequest
   case class KSUpdatePreferredLeaderElection(millis: Long, json: String) extends CommandRequest
   case class KSEndReassignPartition(millis: Long) extends CommandRequest
@@ -175,7 +187,7 @@ object ActorModel {
   case class KSGetBrokerState(id: String) extends  KSRequest
 
   sealed trait KARequest extends QueryRequest
-  case class KAGetGroupSummary(groupList: Seq[String], enqueue: java.util.Queue[(String, kafka.coordinator.GroupSummary)]) extends QueryRequest
+  case class KAGetGroupSummary(groupList: Seq[String], enqueue: java.util.Queue[(String, List[MemberMetadata])]) extends QueryRequest
 
   case class TopicList(list: IndexedSeq[String], deleteSet: Set[String], clusterContext: ClusterContext) extends QueryResponse
   case class TopicConfig(topic: String, config: Option[(Int,String)]) extends QueryResponse
@@ -194,23 +206,30 @@ object ActorModel {
   case class ConsumerNameAndType(name: String, consumerType: ConsumerType)
   case class ConsumerList(list: IndexedSeq[ConsumerNameAndType], clusterContext: ClusterContext) extends QueryResponse
 
+  case class BrokerDescription(broker: Int,
+                               config:Option[(Int,String)]
+                              )extends  QueryResponse
   case class TopicDescription(topic: String,
                               description: (Int,String),
-                              partitionState: Option[Map[String, String]], 
-                              partitionOffsets: Future[PartitionOffsetsCapture],
+                              partitionState: Option[Map[String, String]],
+                              partitionOffsets: PartitionOffsetsCapture,
                               config:Option[(Int,String)]) extends  QueryResponse
   case class TopicDescriptions(descriptions: IndexedSeq[TopicDescription], lastUpdateMillis: Long) extends QueryResponse
 
   case class BrokerList(list: IndexedSeq[BrokerIdentity], clusterContext: ClusterContext) extends QueryResponse
 
-  case class PreferredReplicaElection(startTime: DateTime, 
-                                      topicAndPartition: Set[TopicAndPartition], 
-                                      endTime: Option[DateTime], 
-                                      clusterContext: ClusterContext) extends QueryResponse
-  case class ReassignPartitions(startTime: DateTime, 
-                                partitionsToBeReassigned: Map[TopicAndPartition, Seq[Int]], 
-                                endTime: Option[DateTime], 
-                                clusterContext: ClusterContext) extends QueryResponse
+  case class PreferredReplicaElection(startTime: DateTime,
+                                      topicAndPartition: Set[TopicPartition],
+                                      endTime: Option[DateTime],
+                                      clusterContext: ClusterContext) extends QueryResponse {
+    def sortedTopicPartitionList: List[(String, Int)] = topicAndPartition.toList.map(tp => (tp.topic(), tp.partition())).sortBy(_._1)
+  }
+  case class ReassignPartitions(startTime: DateTime,
+                                partitionsToBeReassigned: Map[TopicPartition, Seq[Int]],
+                                endTime: Option[DateTime],
+                                clusterContext: ClusterContext) extends QueryResponse {
+    def sortedTopicPartitionAssignmentList : List[((String, Int), Seq[Int])] = partitionsToBeReassigned.toList.sortBy(partition => (partition._1.topic(), partition._1.partition())).map { case (tp, a) => ((tp.topic(), tp.partition()), a)}
+  }
 
   case class ConsumedTopicDescription(consumer: String,
                                       topic: String,
@@ -227,12 +246,16 @@ object ActorModel {
   case object DCUpdateState extends CommandRequest
 
   case class GeneratedPartitionAssignments(topic: String, assignments: Map[Int, Seq[Int]], nonExistentBrokers: Set[Int])
-  case class BrokerIdentity(id: Int, host: String, port: Int, jmxPort: Int, secure: Boolean)
 
-  object BrokerIdentity {
+  case class BrokerIdentity(id: Int, host: String, jmxPort: Int, secure: Boolean, nonSecure:Boolean, endpoints: Map[SecurityProtocol, Int], config: List[(String,String)]=List(),configReadVersion: Int= -1) {
+    def endpointsString: String = endpoints.toList.map(tpl => s"${tpl._1.stringId}:${tpl._2}").mkString(",")
+  }
+
+  object BrokerIdentity extends Logging {
     import org.json4s.jackson.JsonMethods._
     import org.json4s.scalaz.JsonScalaz
     import org.json4s.scalaz.JsonScalaz._
+    import org.json4s.JValue
 
     import scala.language.reflectiveCalls
     import scalaz.Validation.FlatMap._
@@ -241,38 +264,62 @@ object ActorModel {
 
     val DEFAULT_SECURE : JsonScalaz.Result[Boolean] = false.successNel
 
+    def getSecurityProtocol(protocol: String, configJson: JValue): SecurityProtocol = {
+      val protocolFromListenerName = (configJson \ "listener_security_protocol_map" \ protocol).values
+      if (protocolFromListenerName == None)
+        SecurityProtocol(protocol)
+      else
+        SecurityProtocol(protocolFromListenerName.toString)
+    }
+
     implicit def from(brokerId: Int, config: String): Validation[NonEmptyList[JsonScalaz.Error],BrokerIdentity]= {
       val json = parse(config)
       val hostResult = fieldExtended[String]("host")(json)
       val portResult = fieldExtended[Int]("port")(json)
       val jmxPortResult = fieldExtended[Int]("jmx_port")(json)
-      val hostPortResult: JsonScalaz.Result[(String, Int, Boolean)] = json.findField(_._1 == "endpoints").map(_ => fieldExtended[List[String]]("endpoints")(json))
-        .fold((hostResult |@| portResult |@| DEFAULT_SECURE)((a, b, c) => (a, b, c))){
+      val hostPortResult: JsonScalaz.Result[(String, Map[SecurityProtocol, Int])] = json.findField(_._1 == "endpoints").map(_ => fieldExtended[List[String]]("endpoints")(json))
+        .fold((hostResult |@| portResult |@| DEFAULT_SECURE)((a, b, c) => (a, Map(PLAINTEXT.asInstanceOf[SecurityProtocol] -> b)))){
         r =>
           r.flatMap {
             endpointList =>
-              val parsedList = endpointList.map {
+              val parsedList: List[JsonScalaz.Result[(String, Int, SecurityProtocol)]] = endpointList.map {
                 endpoint =>
                   Validation.fromTryCatchNonFatal {
-                    val arr = endpoint.split("://")(1).split(":")
-                    (arr(0), arr(1).toInt, endpoint.toLowerCase.contains("sasl"))
-                  }.leftMap[JsonScalaz.Error](t => UncategorizedError("endpoints", t.getMessage, List.empty)).toValidationNel
+                    val arr1 = endpoint.split("://")
+                    val arr2 = arr1(1).split(":")
+                    (arr2(0), arr2(1).toInt, getSecurityProtocol(arr1(0).toUpperCase, json))
+                  }.leftMap[JsonScalaz.Error](t => {
+                    error(s"Failed to parse endpoint : $endpoint", t)
+                    UncategorizedError("endpoints", t.getMessage, List.empty)
+                  }).toValidationNel
               }
-              parsedList.find(_.isSuccess).fold({
-                val err: JsonScalaz.Result[(String, Int, Boolean)] = Validation.failureNel(UncategorizedError("endpoints", s"failed to parse host and port from json : $config", List.empty))
-                err
+              import _root_.scalaz.Scalaz._
+              val listOfValidation: List[JsonScalaz.Result[(String, Int, SecurityProtocol)]] = parsedList.filter(_.isSuccess)
+              if(listOfValidation.nonEmpty) {
+                val endpoints: JsonScalaz.Result[List[(String, Int, SecurityProtocol)]] = parsedList.filter(_.isSuccess).sequence[JsonScalaz.Result, (String, Int, SecurityProtocol)]
+                val result: JsonScalaz.Result[(String, Map[SecurityProtocol, Int])] = endpoints.flatMap {
+                  list =>
+                    list.foldRight(("", Map.empty[SecurityProtocol, Int])) {
+                      case ((host: String, port: Int, endpointType: SecurityProtocol), (_, map: Map[SecurityProtocol, Int])) =>
+                        (host, map.+(endpointType -> port))
+                    }.successNel[JsonScalaz.Error]
+
+                }
+                result
+              } else {
+                (hostResult |@| portResult |@| DEFAULT_SECURE)((a, b, c) => (a, Map(PLAINTEXT.asInstanceOf[SecurityProtocol] -> b)))
               }
-              )(r => r)
           }
       }
       for {
         tpl <- hostPortResult
         host = tpl._1
         port = tpl._2
-        secure = tpl._3
+        secure = (tpl._2.contains(PLAINTEXT) && tpl._2.size > 1) || (!tpl._2.contains(PLAINTEXT) && tpl._2.nonEmpty)
+        nonSecure = tpl._2.contains(PLAINTEXT)
         jmxPort <- jmxPortResult
       } yield {
-        BrokerIdentity(brokerId, host, port, jmxPort, secure)
+        BrokerIdentity(brokerId, host, jmxPort, secure, nonSecure, tpl._2)
       }
     }
   }
@@ -335,7 +382,7 @@ import scala.language.reflectiveCalls
 
   object PartitionOffsetsCapture {
     val ZERO : Option[Double] = Option(0D)
-    
+
     val EMPTY : PartitionOffsetsCapture = PartitionOffsetsCapture(0, Map.empty)
 
     def getRate(part: Int, currentOffsets: PartitionOffsetsCapture, previousOffsets: PartitionOffsetsCapture): Option[Double] = {
@@ -429,6 +476,27 @@ import scala.language.reflectiveCalls
     import scala.language.reflectiveCalls
     import scala.concurrent.duration._
 
+    def parseCofig(config: Option[(Int,String)]): (Int,Map[String, String]) ={
+      import org.json4s.jackson.JsonMethods._
+      import org.json4s.scalaz.JsonScalaz._
+      import org.json4s._
+      try {
+        val resultOption: Option[(Int,Map[String, String])] = config.map { configString =>
+          val configJson = parse(configString._2)
+          val configMap : Map[String, String] = field[Map[String,String]]("config")(configJson).fold({ e =>
+            logger.error(s"Failed to parse topic config ${configString._2}")
+            Map.empty
+          }, identity)
+          (configString._1,configMap)
+        }
+        resultOption.getOrElse((-1,Map.empty[String, String]))
+      } catch {
+        case e: Exception =>
+          logger.error(s"[Failed to parse config : ${config.getOrElse("")}",e)
+          (-1,Map.empty[String, String])
+      }
+    }
+
     implicit val formats = Serialization.formats(FullTypeHints(List(classOf[TopicIdentity])))
     // Adding a write method to transform/sort the partitionsIdentity to be more readable in JSON and include Topic Identity vals
     implicit def topicIdentityJSONW: JSONW[TopicIdentity] = new JSONW[TopicIdentity] {
@@ -473,31 +541,10 @@ import scala.language.reflectiveCalls
       // Assign the partition data to the TPI format
       partMap.map { case (partition, replicas) =>
         val partitionNum = partition.toInt
-        // block on the futures that hold the latest produced offset in each partition
-        val partitionOffsets: Option[PartitionOffsetsCapture] = Try {
-          Await.ready(td.partitionOffsets, 2 second).value.get match {
-            case Success(offsetMap) =>
-              Option(offsetMap)
-            case Failure(e) =>
-              None
-          }
-        } match  {
-          case Failure(e) => None
-          case Success(r) => r
-        }
-
-        val previousPartitionOffsets: Option[PartitionOffsetsCapture] = tdPrevious.flatMap {
-          ptd => Try {
-            Await.ready(ptd.partitionOffsets, 2 second).value.get match {
-              case Success(offsetMap) =>
-                Option(offsetMap)
-              case Failure(e) =>
-                None
-            }
-          } match {
-            case Failure(e) => None
-            case Success(r) => r
-          }
+        val partitionOffsets: Option[PartitionOffsetsCapture] = Some(td.partitionOffsets)
+        val previousPartitionOffsets: Option[PartitionOffsetsCapture] = tdPrevious match {
+          case Some(tdP) => Some(tdP.partitionOffsets)
+          case None => None
         }
         
         val currentOffsetOption = partitionOffsets.flatMap(_.offsetsMap.get(partitionNum))
@@ -532,21 +579,7 @@ import scala.language.reflectiveCalls
       val partMap = getPartitionReplicaMap(td)
       val tpi : Map[Int,TopicPartitionIdentity] = getTopicPartitionIdentity(td, partMap, tdPrevious, tpSizes.getOrElse(Map.empty))
       val config : (Int,Map[String, String]) = {
-        try {
-          val resultOption: Option[(Int,Map[String, String])] = td.config.map { configString =>
-            val configJson = parse(configString._2)
-            val configMap : Map[String, String] = field[Map[String,String]]("config")(configJson).fold({ e =>
-              logger.error(s"Failed to parse topic config ${configString._2}")
-              Map.empty
-            }, identity)
-            (configString._1,configMap)
-          }
-          resultOption.getOrElse((-1,Map.empty[String, String]))
-        } catch {
-          case e: Exception =>
-            logger.error(s"[topic=${td.topic}] Failed to parse topic config : ${td.config.getOrElse("")}",e)
-            (-1,Map.empty[String, String])
-        }
+        parseCofig(td.config)
       }
       val size = tpi.flatMap(_._2.leaderSize).reduceLeftOption{ _ + _ }.map(FormatMetric.sizeFormat(_))
       TopicIdentity(td.topic,td.description._1,partMap.size,tpi,brokers,config._1,config._2.toList, clusterContext, tm, size)
@@ -622,20 +655,11 @@ import scala.language.reflectiveCalls
     def from(ctd: ConsumedTopicDescription, clusterContext: ClusterContext): ConsumedTopicState = {
       val partitionOffsetsMap = ctd.partitionOffsets.getOrElse(Map.empty)
       val partitionOwnersMap = ctd.partitionOwners.getOrElse(Map.empty)
-      // block on the futures that hold the latest produced offset in each partition
-      val topicOffsetsOptMap: Map[Int, Long]= ctd.topicDescription.map{td: TopicDescription =>
-        Try {
-          Await.ready(td.partitionOffsets, 2 second).value.get match {
-            case Success(offsetMap) =>
-              offsetMap.offsetsMap
-            case Failure(e) =>
-              Map.empty[Int, Long]
-          }
-        } match {
-          case Failure(e) => Map.empty[Int, Long]
-          case Success(r) => r
-        }
-      }.getOrElse(Map.empty)
+
+      val topicOffsetsOptMap: Map[Int, Long]= ctd.topicDescription match {
+        case Some(td) => td.partitionOffsets.offsetsMap
+        case None => Map.empty
+      }
 
       ConsumedTopicState(
         ctd.consumer, 
@@ -650,7 +674,7 @@ import scala.language.reflectiveCalls
 
   case class ConsumerIdentity(consumerGroup:String,
                               consumerType: ConsumerType,
-                              topicMap: Map[String, ConsumedTopicState],
+                              topicMap: collection.Map[String, ConsumedTopicState],
                               clusterContext: ClusterContext)
   object ConsumerIdentity extends Logging {
     import scala.language.reflectiveCalls
@@ -663,7 +687,7 @@ import scala.language.reflectiveCalls
       } yield (topic, cts)
       ConsumerIdentity(cd.consumer,
         cd.consumerType,
-        topicMap.toMap,
+        SortedMap(topicMap: _*),
         clusterContext)
     }
 
@@ -707,7 +731,7 @@ import scala.language.reflectiveCalls
   }
 
   case class BrokerClusterStats(perMessages: BigDecimal, perIncoming: BigDecimal, perOutgoing: BigDecimal)
-  
+
   sealed trait LKVRequest extends QueryRequest
 
   case object LKVForceUpdate extends CommandRequest

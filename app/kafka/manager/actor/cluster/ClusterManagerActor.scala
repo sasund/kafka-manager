@@ -12,17 +12,18 @@ import java.util.concurrent.{LinkedBlockingQueue, ThreadPoolExecutor, TimeUnit}
 import akka.actor.{ActorPath, Props}
 import akka.pattern._
 import akka.util.Timeout
-import kafka.common.TopicAndPartition
 import kafka.manager.base._
 import kafka.manager.base.cluster.BaseClusterQueryCommandActor
 import kafka.manager.features.{ClusterFeatures, KMJMXMetricsFeature, KMLogKafkaFeature}
 import kafka.manager.logkafka._
-import kafka.manager.model.{ClusterContext, ClusterConfig, CuratorConfig}
+import kafka.manager.model.{ClusterConfig, ClusterContext, CuratorConfig}
 import kafka.manager.utils.AdminUtils
+import kafka.manager.utils.zero81.SchedulePreferredLeaderElectionCommand
 import org.apache.curator.framework.CuratorFramework
 import org.apache.curator.framework.recipes.cache.PathChildrenCache
 import org.apache.curator.framework.recipes.cache.PathChildrenCache.StartMode
 import org.apache.curator.framework.recipes.locks.InterProcessSemaphoreMutex
+import org.apache.kafka.common.TopicPartition
 import org.apache.zookeeper.CreateMode
 
 import scala.concurrent.duration.{FiniteDuration, _}
@@ -101,16 +102,32 @@ class ClusterManagerActor(cmConfig: ClusterManagerActorConfig)
 
   private[this] val adminUtils = new AdminUtils(cmConfig.clusterConfig.version)
 
-  private[this] val ksConfig = KafkaStateActorConfig(
-    sharedClusterCurator
-    , cmConfig.pinnedDispatcherName
-    , clusterContext
-    , LongRunningPoolConfig(clusterConfig.tuning.get.offsetCacheThreadPoolSize.get, clusterConfig.tuning.get.offsetCacheThreadPoolQueueSize.get)
-    , LongRunningPoolConfig(clusterConfig.tuning.get.kafkaAdminClientThreadPoolSize.get, clusterConfig.tuning.get.kafkaAdminClientThreadPoolQueueSize.get)
-    , clusterConfig.tuning.get.partitionOffsetCacheTimeoutSecs.get
-    , cmConfig.simpleConsumerSocketTimeoutMillis
-    , cmConfig.consumerProperties
-  )
+  private[this] val ksConfig = {
+    val kafkaManagedOffsetCacheConfigOption : Option[KafkaManagedOffsetCacheConfig] = for {
+      tuning <- cmConfig.clusterConfig.tuning
+      groupMemberMetadataCheckMillis = tuning.kafkaManagedOffsetMetadataCheckMillis
+      groupTopicPartitionOffsetExpireDays =  tuning.kafkaManagedOffsetGroupExpireDays
+      groupTopicPartitionOffsetMaxSize = tuning.kafkaManagedOffsetGroupCacheSize
+    } yield {
+      KafkaManagedOffsetCacheConfig(
+        groupMemberMetadataCheckMillis = groupMemberMetadataCheckMillis.getOrElse(KafkaManagedOffsetCacheConfig.defaultGroupMemberMetadataCheckMillis)
+        , groupTopicPartitionOffsetExpireDays = groupTopicPartitionOffsetExpireDays.getOrElse(KafkaManagedOffsetCacheConfig.defaultGroupTopicPartitionOffsetExpireDays)
+        , groupTopicPartitionOffsetMaxSize = groupTopicPartitionOffsetMaxSize.getOrElse(KafkaManagedOffsetCacheConfig.defaultGroupTopicPartitionOffsetMaxSize)
+      )
+    }
+    KafkaStateActorConfig(
+      sharedClusterCurator
+      , cmConfig.pinnedDispatcherName
+      , clusterContext
+      , LongRunningPoolConfig(clusterConfig.tuning.get.offsetCacheThreadPoolSize.get, clusterConfig.tuning.get.offsetCacheThreadPoolQueueSize.get)
+      , LongRunningPoolConfig(clusterConfig.tuning.get.kafkaAdminClientThreadPoolSize.get, clusterConfig.tuning.get.kafkaAdminClientThreadPoolQueueSize.get)
+      , clusterConfig.tuning.get.partitionOffsetCacheTimeoutSecs.get
+      , cmConfig.simpleConsumerSocketTimeoutMillis
+      , cmConfig.consumerProperties
+      , kafkaManagedOffsetCacheConfig = kafkaManagedOffsetCacheConfigOption.getOrElse(KafkaManagedOffsetCacheConfig()
+      )
+    )
+  }
   private[this] val ksProps = Props(classOf[KafkaStateActor],ksConfig)
   private[this] val kafkaStateActor : ActorPath = context.actorOf(ksProps.withDispatcher(cmConfig.pinnedDispatcherName),"kafka-state").path
 
@@ -259,6 +276,27 @@ class ClusterManagerActor(cmConfig: ClusterManagerActorConfig)
         } yield CMView(tl.list.size, bl.list.size, clusterContext)
         result pipeTo sender
 
+      case CMGetBrokerIdentity(id) =>
+        implicit val ec = context.dispatcher
+        val eventualBrokerList = withKafkaStateActor(KSGetBrokers)(identity[BrokerList])
+        val eventualBrokerConfig = withKafkaStateActor(KSGetBrokerDescription(id))(identity[Option[BrokerDescription]])
+        val result: Future[Option[CMBrokerIdentity]] = for {
+          bl <- eventualBrokerList
+          bc <- eventualBrokerConfig
+        } yield bl.list.find(x => x.id == id)
+          .flatMap { x =>
+            if(bc.isEmpty){
+              Option(CMBrokerIdentity(Try(x)))
+            }
+            else{
+              bc.map(c => TopicIdentity.parseCofig(c.config))
+                .map(c => BrokerIdentity(x.id, x.host, x.jmxPort, x.secure, x.nonSecure, x.endpoints, c._2.toList, c._1))
+                .map(b => CMBrokerIdentity(Try(b)))
+            }
+
+          }
+        result pipeTo sender
+
       case CMGetTopicIdentity(topic) =>
         implicit val ec = context.dispatcher
         val eventualBrokerList = withKafkaStateActor(KSGetBrokers)(identity[BrokerList])
@@ -335,6 +373,13 @@ class ClusterManagerActor(cmConfig: ClusterManagerActorConfig)
         curator.setData().forPath(topicZkPath, data)
       }
     }
+  }
+
+  private def writeScheduleLeaderElectionToZk(schedule: Map[String, Int]) = {
+    implicit val ec = longRunningExecutionContext
+
+    log.info("Updating schedule for preferred leader election")
+    SchedulePreferredLeaderElectionCommand.writeScheduleLeaderElectionData(curator, schedule)
   }
   
   implicit private def toTryClusterContext(t: Try[Unit]) : Try[ClusterContext] = {
@@ -423,6 +468,26 @@ class ClusterManagerActor(cmConfig: ClusterManagerActorConfig)
           }
         } pipeTo sender()
 
+      case CMUpdateBrokerConfig(broker, config, readVersion) =>
+        implicit val ec = longRunningExecutionContext
+        val eventualBrokerList = withKafkaStateActor(KSGetBrokers)(identity[BrokerList])
+        eventualBrokerList.map{
+          bl=>{
+            val exist = bl.list.exists(x=>x.id==broker)
+            if(!exist){
+              Future.successful(CMCommandResult(Failure(new IllegalArgumentException(s"Broker doesn't exist : $broker"))))
+            }
+            else{
+              withKafkaCommandActor(KCUpdateBrokerConfig(broker, config, readVersion))
+              {
+                kcResponse: KCCommandResult =>
+                  CMCommandResult(kcResponse.result)
+              }
+            }
+          }
+        } pipeTo sender()
+
+
       case CMUpdateTopicConfig(topic, config, readVersion) =>
         implicit val ec = longRunningExecutionContext
         val eventualTopicDescription = withKafkaStateActor(KSGetTopicDescription(topic))(identity[Option[TopicDescription]])
@@ -444,7 +509,7 @@ class ClusterManagerActor(cmConfig: ClusterManagerActorConfig)
           }
         } pipeTo sender()
 
-      case CMGeneratePartitionAssignments(topics, brokers) =>
+      case CMGeneratePartitionAssignments(topics, brokers, replicationFactor) =>
         implicit val ec = longRunningExecutionContext
         val topicCheckFutureBefore = checkTopicsUnderAssignment(topics)
 
@@ -462,7 +527,7 @@ class ClusterManagerActor(cmConfig: ClusterManagerActorConfig)
             tis.map(ti => (ti.topic, adminUtils.assignReplicasToBrokers(
               brokers,
               ti.partitions,
-              ti.replicationFactor)))
+              replicationFactor.getOrElse(ti.replicationFactor))))
           }
         }
 
@@ -497,13 +562,17 @@ class ClusterManagerActor(cmConfig: ClusterManagerActorConfig)
           bl <- eventualBrokerList
           tds <- eventualDescriptions
           tis = tds.descriptions.map(TopicIdentity.from(bl, _, None, None, clusterContext, None))
-          toElect = tis.flatMap(ti => ti.partitionsIdentity.values.filter(!_.isPreferredLeader).map(tpi => TopicAndPartition(ti.topic, tpi.partNum))).toSet
+          toElect = tis.flatMap(ti => ti.partitionsIdentity.values.filter(!_.isPreferredLeader).map(tpi => new TopicPartition(ti.topic, tpi.partNum))).toSet
         } yield toElect
         preferredLeaderElections.map { toElect =>
           withKafkaCommandActor(KCPreferredReplicaLeaderElection(toElect)) { kcResponse: KCCommandResult =>
             CMCommandResult(kcResponse.result)
           }
         } pipeTo sender()
+
+      case CMSchedulePreferredLeaderElection(schedule) =>
+        implicit val ec = longRunningExecutionContext
+        writeScheduleLeaderElectionToZk(schedule)
 
       case CMRunReassignPartition(topics, forceSet) =>
         implicit val ec = longRunningExecutionContext
@@ -606,8 +675,11 @@ class ClusterManagerActor(cmConfig: ClusterManagerActorConfig)
 
   private[this] def modify[T](fn: => T): T = {
     try {
-      mutex.acquire(cmConfig.mutexTimeoutMillis,TimeUnit.MILLISECONDS)
-      fn
+      if(mutex.acquire(cmConfig.mutexTimeoutMillis,TimeUnit.MILLISECONDS)) {
+        fn
+      } else {
+        throw new RuntimeException("Failed to acquire mutex for cluster manager command")
+      }
     } finally {
       if(mutex.isAcquiredInThisProcess) {
         mutex.release()

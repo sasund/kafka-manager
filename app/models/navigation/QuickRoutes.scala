@@ -14,9 +14,9 @@ object QuickRoutes {
   import models.navigation.BreadCrumbs._
 
   val baseRoutes : Map[String, () => Call] = Map(
-    "Clusters" -> controllers.routes.Application.index,
-    "List" -> controllers.routes.Application.index,
-    "Add Cluster" -> controllers.routes.Cluster.addCluster
+    "Clusters" -> { () => controllers.routes.Application.index() },
+    "List" -> { () => controllers.routes.Application.index() },
+    "Add Cluster" -> { () => controllers.routes.Cluster.addCluster() }
   )
   val clusterRoutes : Map[String, String => Call] = Map(
     "Update Cluster" -> controllers.routes.Cluster.updateCluster,
@@ -27,11 +27,17 @@ object QuickRoutes {
     "List" -> controllers.routes.Topic.topics,
     "Create" -> controllers.routes.Topic.createTopic,
     "Preferred Replica Election" -> controllers.routes.PreferredReplicaElection.preferredReplicaElection,
+    "Schedule Leader Election" -> controllers.routes.PreferredReplicaElection.scheduleRunElection,
     "Reassign Partitions" -> controllers.routes.ReassignPartitions.reassignPartitions,
     "Logkafkas" -> controllers.routes.Logkafka.logkafkas,
     "List Logkafka" -> controllers.routes.Logkafka.logkafkas,
     "Create Logkafka" -> controllers.routes.Logkafka.createLogkafka
   )
+
+  val brokerRoutes : Map[String, (String, Int) => Call] = Map(
+    "Broker View" -> ((c,t)=>controllers.routes.Cluster.broker(c,t)),
+  )
+
   val topicRoutes : Map[String, (String, String) => Call] = Map(
     "Topic View" -> ((c, t) => controllers.routes.Topic.topic(c, t, force=false)),
     "Add Partitions" -> controllers.routes.Topic.addPartitions,
@@ -81,6 +87,12 @@ object QuickRoutes {
     }
     def topicRoute(c: String, t: List[String]): Call = {
       topicRoutes(s)(c,t.head)
+    }
+  }
+
+  implicit class BrokerRoute(s: String) {
+    def brokerRoute(c: String, t: List[String]): Call = {
+      brokerRoutes(s)(c,t.head.toInt)
     }
   }
 

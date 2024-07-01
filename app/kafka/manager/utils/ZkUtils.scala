@@ -19,10 +19,10 @@ package kafka.manager.utils
 
 import java.nio.charset.StandardCharsets
 
-import kafka.common.TopicAndPartition
 import org.apache.curator.framework.CuratorFramework
+import org.apache.kafka.common.TopicPartition
 import org.apache.zookeeper.CreateMode
-import org.apache.zookeeper.KeeperException.{NodeExistsException, NoNodeException}
+import org.apache.zookeeper.KeeperException.{NoNodeException, NodeExistsException}
 import org.apache.zookeeper.data.Stat
 
 /**
@@ -34,6 +34,7 @@ object ZkUtils {
   val ConsumersPath = "/consumers"
   val BrokerIdsPath = "/brokers/ids"
   val BrokerTopicsPath = "/brokers/topics"
+  val BrokerConfigPath = "/config/brokers"
   val TopicConfigPath = "/config/topics"
   val TopicConfigChangesPath = "/config/changes"
   val ControllerPath = "/controller"
@@ -42,6 +43,7 @@ object ZkUtils {
   val DeleteTopicsPath = "/admin/delete_topics"
   val PreferredReplicaLeaderElectionPath = "/admin/preferred_replica_election"
   val AdminPath = "/admin"
+  val SchedulePreferredLeaderElectionPath = AdminPath + "/schedule_leader_election"
 
   def getTopicPath(topic: String): String = {
     BrokerTopicsPath + "/" + topic
@@ -53,6 +55,9 @@ object ZkUtils {
 
   def getTopicConfigPath(topic: String): String =
     TopicConfigPath + "/" + topic
+
+  def getBrokerConfigPath(broker: Int): String =
+    BrokerConfigPath + "/" + broker.toString
 
   def getDeleteTopicPath(topic: String): String =
     DeleteTopicsPath + "/" + topic
@@ -121,7 +126,7 @@ object ZkUtils {
   }
 
 
-  def getPartitionReassignmentZkData(partitionsToBeReassigned: Map[TopicAndPartition, Seq[Int]]): String = {
+  def getPartitionReassignmentZkData(partitionsToBeReassigned: Map[TopicPartition, Seq[Int]]): String = {
     toJson(Map("version" -> 1, "partitions" -> partitionsToBeReassigned.map(e => Map("topic" -> e._1.topic, "partition" -> e._1.partition,
       "replicas" -> e._2))))
   }
